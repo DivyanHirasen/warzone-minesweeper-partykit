@@ -1,244 +1,227 @@
 import type * as Party from "partykit/server";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+type GameStatus = "waiting" | "playing" | "ended";
 
-type GameStatus = "idle" | "playing" | "won" | "lost";
+interface PlayerState {
+  id: string;
+  health: number;
+  rockets: number;
+  isBuilding: boolean;
+  buildEndsAt: number | null;
+  ready: boolean;
+}
 
-interface GameState {
-  rows: number;
-  cols: number;
-  mines: number;
-  grid: number[][];        // -1 = mine, 0-8 = number
-  revealed: boolean[][];
-  flagged: boolean[][];
-  minePos: number[];       // flat indices
+interface RoomState {
+  players: Record<string, PlayerState>;
   status: GameStatus;
-  scores: Record<string, number>; // playerId -> cells revealed
-  difficulty: string;
+  winnerId: string | null;
 }
 
 type ClientMsg =
-  | { type: "REVEAL"; x: number; y: number }
-  | { type: "FLAG";   x: number; y: number }
-  | { type: "RESET";  difficulty?: string };
+  | { type: "BUILD_ROCKET" }
+  | { type: "FIRE_ROCKET" }
+  | { type: "READY" };
 
-// ─── Difficulty configs ───────────────────────────────────────────────────────
+const MAX_PLAYERS = 2;
+const ROCKET_BUILD_MS = 10_000;
+const ROCKET_DAMAGE = 20;
+const STARTING_HEALTH = 100;
 
-const CONFIGS: Record<string, { rows: number; cols: number; mines: number }> = {
-  easy:   { rows: 9,  cols: 9,  mines: 10 },
-  medium: { rows: 16, cols: 16, mines: 40 },
-  hard:   { rows: 16, cols: 30, mines: 99 },
-};
-
-// ─── Server ──────────────────────────────────────────────────────────────────
-
-export default class MinesweeperServer implements Party.Server {
-  private state: GameState | null = null;
+export default class SpaceWarServer implements Party.Server {
+  private state: RoomState = { players: {}, status: "waiting", winnerId: null };
+  private buildTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
   constructor(readonly room: Party.Room) {}
 
-  // ── Lifecycle ──────────────────────────────────────────────────────────────
-
   onConnect(conn: Party.Connection) {
-    if (!this.state) {
-      this.state = this.createState("easy");
+    const playerCount = Object.keys(this.state.players).length;
+
+    if (playerCount >= MAX_PLAYERS) {
+      conn.send(JSON.stringify({ type: "ROOM_FULL", message: "Room is full (2/2 players)." }));
+      conn.close();
+      return;
     }
-    // Send full state to the new player
-    conn.send(JSON.stringify({ type: "STATE", state: this.serializeState() }));
+
+    this.state.players[conn.id] = {
+      id: conn.id,
+      health: STARTING_HEALTH,
+      rockets: 0,
+      isBuilding: false,
+      buildEndsAt: null,
+      ready: false,
+    };
+
+    const newCount = Object.keys(this.state.players).length;
+    if (newCount === 1) {
+      conn.send(JSON.stringify({ type: "WAITING_FOR_OPPONENT" }));
+    } else {
+      // Second player joined — notify both
+      this.sendState(conn.id);
+      const otherId = this.getOpponentId(conn.id);
+      if (otherId) this.sendState(otherId);
+    }
+  }
+
+  onClose(conn: Party.Connection) {
+    const player = this.state.players[conn.id];
+    if (!player) return;
+
+    // Cancel any pending build timer
+    if (this.buildTimers[conn.id]) {
+      clearTimeout(this.buildTimers[conn.id]);
+      delete this.buildTimers[conn.id];
+    }
+
+    delete this.state.players[conn.id];
+
+    const opponentId = this.getOpponentId(conn.id);
+    if (opponentId) {
+      const opponentConn = this.getConn(opponentId);
+      if (opponentConn) {
+        opponentConn.send(JSON.stringify({ type: "OPPONENT_DISCONNECTED" }));
+      }
+    }
+
+    // If game was playing, pause it back to waiting
+    if (this.state.status === "playing") {
+      this.state.status = "waiting";
+    }
   }
 
   onMessage(raw: string, sender: Party.Connection) {
-    if (!this.state) this.state = this.createState("easy");
-
     let msg: ClientMsg;
     try { msg = JSON.parse(raw); } catch { return; }
 
+    const player = this.state.players[sender.id];
+    if (!player) return;
+
     switch (msg.type) {
-      case "REVEAL": this.handleReveal(msg.x, msg.y, sender.id); break;
-      case "FLAG":   this.handleFlag(msg.x, msg.y);              break;
-      case "RESET":  this.handleReset(msg.difficulty);           break;
+      case "READY":     this.handleReady(sender.id); break;
+      case "BUILD_ROCKET": this.handleBuild(sender.id); break;
+      case "FIRE_ROCKET":  this.handleFire(sender.id); break;
     }
   }
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
-  private handleReveal(x: number, y: number, playerId: string) {
-    const s = this.state!;
-    if (s.status === "won" || s.status === "lost") return;
-    if (s.revealed[y][x] || s.flagged[y][x]) return;
+  private handleReady(playerId: string) {
+    const player = this.state.players[playerId];
+    if (!player || this.state.status !== "waiting") return;
+    player.ready = true;
 
-    // First click: place mines with safe zone
-    if (s.status === "idle") {
-      this.placeMines(x, y);
-      s.status = "playing";
+    const players = Object.values(this.state.players);
+    if (players.length === 2 && players.every(p => p.ready)) {
+      this.state.status = "playing";
+      for (const p of players) this.sendState(p.id);
+    } else {
+      this.sendState(playerId);
     }
+  }
 
-    // Flood fill reveal
-    const newlyRevealed: Array<{ x: number; y: number; value: number }> = [];
-    this.floodReveal(x, y, newlyRevealed, s);
+  private handleBuild(playerId: string) {
+    const player = this.state.players[playerId];
+    if (!player || this.state.status !== "playing") return;
+    if (player.isBuilding) return; // already building
 
-    if (!s.scores[playerId]) s.scores[playerId] = 0;
+    player.isBuilding = true;
+    player.buildEndsAt = Date.now() + ROCKET_BUILD_MS;
+    this.sendState(playerId);
 
-    if (s.grid[y][x] === -1) {
-      // Hit a mine
-      s.status = "lost";
-      this.room.broadcast(JSON.stringify({
-        type: "GAME_OVER",
-        won: false,
-        minePos: s.minePos,
-        explodeX: x,
-        explodeY: y,
-        scores: s.scores,
+    this.buildTimers[playerId] = setTimeout(() => {
+      const p = this.state.players[playerId];
+      if (!p) return;
+      p.isBuilding = false;
+      p.buildEndsAt = null;
+      p.rockets += 1;
+      delete this.buildTimers[playerId];
+
+      const conn = this.getConn(playerId);
+      if (conn) {
+        conn.send(JSON.stringify({ type: "ROCKET_READY" }));
+        this.sendState(playerId);
+      }
+    }, ROCKET_BUILD_MS);
+  }
+
+  private handleFire(playerId: string) {
+    const player = this.state.players[playerId];
+    if (!player || this.state.status !== "playing") return;
+    if (player.rockets < 1) return;
+
+    const opponentId = this.getOpponentId(playerId);
+    if (!opponentId) return;
+    const opponent = this.state.players[opponentId];
+    if (!opponent) return;
+
+    player.rockets -= 1;
+    opponent.health = Math.max(0, opponent.health - ROCKET_DAMAGE);
+
+    // Confirm to shooter
+    const shooterConn = this.getConn(playerId);
+    if (shooterConn) {
+      shooterConn.send(JSON.stringify({
+        type: "FIRE_CONFIRMED",
+        opponentNewHealth: opponent.health,
       }));
-      return;
+      this.sendState(playerId);
     }
 
-    // Credit score (only safe cells)
-    s.scores[playerId] += newlyRevealed.length;
+    // Notify defender
+    const defenderConn = this.getConn(opponentId);
+    if (defenderConn) {
+      defenderConn.send(JSON.stringify({
+        type: "ATTACKED",
+        damage: ROCKET_DAMAGE,
+        newHealth: opponent.health,
+      }));
+      this.sendState(opponentId);
+    }
 
-    this.room.broadcast(JSON.stringify({
-      type: "CELLS_REVEALED",
-      cells: newlyRevealed,
-      scores: s.scores,
-    }));
-
-    // Check win
-    if (this.checkWin()) {
-      s.status = "won";
+    // Check win condition
+    if (opponent.health <= 0) {
+      this.state.status = "ended";
+      this.state.winnerId = playerId;
       this.room.broadcast(JSON.stringify({
         type: "GAME_OVER",
-        won: true,
-        scores: s.scores,
+        winnerId: playerId,
       }));
     }
   }
 
-  private handleFlag(x: number, y: number) {
-    const s = this.state!;
-    if (s.status === "won" || s.status === "lost") return;
-    if (s.revealed[y][x]) return;
+  // ── Helpers ───────────────────────────────────────────────────────────────
 
-    s.flagged[y][x] = !s.flagged[y][x];
-    this.room.broadcast(JSON.stringify({
-      type: "CELL_FLAGGED",
-      x, y,
-      flagged: s.flagged[y][x],
-    }));
-  }
+  private sendState(playerId: string) {
+    const conn = this.getConn(playerId);
+    if (!conn) return;
+    const player = this.state.players[playerId];
+    if (!player) return;
+    const opponentId = this.getOpponentId(playerId);
+    const opponent = opponentId ? this.state.players[opponentId] : null;
 
-  private handleReset(difficulty?: string) {
-    const diff = difficulty && CONFIGS[difficulty] ? difficulty : (this.state?.difficulty ?? "easy");
-    this.state = this.createState(diff);
-    this.room.broadcast(JSON.stringify({
+    conn.send(JSON.stringify({
       type: "STATE",
-      state: this.serializeState(),
+      health: player.health,
+      rockets: player.rockets,
+      isBuilding: player.isBuilding,
+      buildEndsAt: player.buildEndsAt,
+      gameStatus: this.state.status,
+      opponentHealth: opponent?.health ?? null,
+      opponentConnected: !!opponent,
+      winnerId: this.state.winnerId,
+      isWinner: this.state.winnerId === playerId,
     }));
   }
 
-  // ── Game logic ─────────────────────────────────────────────────────────────
-
-  private createState(difficulty: string): GameState {
-    const cfg = CONFIGS[difficulty] ?? CONFIGS.easy;
-    const { rows, cols } = cfg;
-    const grid: number[][] = Array.from({ length: rows }, () => Array(cols).fill(0));
-    const revealed: boolean[][] = Array.from({ length: rows }, () => Array(cols).fill(false));
-    const flagged: boolean[][] = Array.from({ length: rows }, () => Array(cols).fill(false));
-    return { ...cfg, grid, revealed, flagged, minePos: [], status: "idle", scores: {}, difficulty };
+  private getOpponentId(playerId: string): string | null {
+    return Object.keys(this.state.players).find(id => id !== playerId) ?? null;
   }
 
-  private placeMines(safeX: number, safeY: number) {
-    const s = this.state!;
-    const { rows, cols, mines } = s;
-    const safe = new Set<number>();
-    for (let dr = -1; dr <= 1; dr++) {
-      for (let dc = -1; dc <= 1; dc++) {
-        const nr = safeY + dr, nc = safeX + dc;
-        if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) safe.add(nr * cols + nc);
-      }
+  private getConn(playerId: string): Party.Connection | null {
+    for (const conn of this.room.getConnections()) {
+      if (conn.id === playerId) return conn;
     }
-
-    const mineSet = new Set<number>();
-    while (mineSet.size < mines) {
-      const idx = Math.floor(Math.random() * rows * cols);
-      if (!safe.has(idx)) mineSet.add(idx);
-    }
-    s.minePos = [...mineSet];
-
-    // Mark mines and compute numbers
-    for (const idx of mineSet) {
-      const r = Math.floor(idx / cols), c = idx % cols;
-      s.grid[r][c] = -1;
-    }
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        if (s.grid[r][c] === -1) continue;
-        let count = 0;
-        for (let dr = -1; dr <= 1; dr++) {
-          for (let dc = -1; dc <= 1; dc++) {
-            const nr = r + dr, nc = c + dc;
-            if (nr >= 0 && nr < rows && nc >= 0 && nc < cols && s.grid[nr][nc] === -1) count++;
-          }
-        }
-        s.grid[r][c] = count;
-      }
-    }
-  }
-
-  private floodReveal(
-    x: number, y: number,
-    out: Array<{ x: number; y: number; value: number }>,
-    s: GameState
-  ) {
-    const { rows, cols } = s;
-    const stack: Array<[number, number]> = [[x, y]];
-    while (stack.length) {
-      const [cx, cy] = stack.pop()!;
-      if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-      if (s.revealed[cy][cx] || s.flagged[cy][cx]) continue;
-      s.revealed[cy][cx] = true;
-      out.push({ x: cx, y: cy, value: s.grid[cy][cx] });
-      if (s.grid[cy][cx] === 0) {
-        for (let dr = -1; dr <= 1; dr++) {
-          for (let dc = -1; dc <= 1; dc++) {
-            if (dr === 0 && dc === 0) continue;
-            stack.push([cx + dc, cy + dr]);
-          }
-        }
-      }
-    }
-  }
-
-  private checkWin(): boolean {
-    const s = this.state!;
-    const { rows, cols, mines } = s;
-    let count = 0;
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) if (s.revealed[r][c]) count++;
-    return count === rows * cols - mines;
-  }
-
-  // ── Serialization ──────────────────────────────────────────────────────────
-
-  private serializeState() {
-    const s = this.state!;
-    const gameOver = s.status === "lost" || s.status === "won";
-    // Send grid values only for revealed cells (safe — numbers don't reveal mine positions)
-    // and all values on game over
-    const grid = s.grid.map((row, r) =>
-      row.map((v, c) => (gameOver || s.revealed[r][c]) ? v : 0)
-    );
-    return {
-      rows: s.rows,
-      cols: s.cols,
-      mines: s.mines,
-      grid,
-      revealed: s.revealed,
-      flagged: s.flagged,
-      minePos: gameOver ? s.minePos : [],
-      status: s.status,
-      scores: s.scores,
-      difficulty: s.difficulty,
-    };
+    return null;
   }
 }
 
-MinesweeperServer satisfies Party.Worker;
+SpaceWarServer satisfies Party.Worker;

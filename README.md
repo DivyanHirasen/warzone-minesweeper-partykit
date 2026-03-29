@@ -1,76 +1,65 @@
-# warzone-minesweeper-partykite an OAuth token (useful for CI/CD)
-npx partykit token generate
+# Space War
+
+A 2-player real-time PvP browser game built with [PartyKit](https://partykit.io).
+
+Two players share a room link. Each manages their own base in secret — building rockets and firing at the opponent. First to reach 0 HP loses.
+
+## How to play
+
+1. Open the game and share the URL with your opponent
+2. Both players click **READY** to start
+3. Click **BUILD ROCKET** — takes 10 seconds to construct
+4. Click **FIRE** to deal 20 damage to the enemy base
+5. Destroy the enemy base (100 HP) to win
+
+You can't see your opponent's rockets or build status — you only find out when you get hit.
+
+## Project structure
+
 ```
-ve an env var
-npx partykit env remove <key>
-
-# Pull env vars into a file (defaults to partykit.json)
-npx partykit env pull
-npx partykit env pull .env.json
-
-# Push env vars from partykit.json to the platform
-npx partykit env push
+gave-proper/
+  src/
+    server.ts   — PartyKit server (all game logic lives here)
+    client.ts   — unused, game runs from index.html
+  public/
+    index.html  — single-file frontend (UI + WebSocket client)
+  partykit.json
 ```
 
-> Note: run `npx partykit deploy` after adding/pushing env vars for changes to take effect.
-
-### Authentication Commands
+## Development
 
 ```bash
-# Log in via GitHub (opens browser)
-npx partykit login
+cd gave-proper
+npm install
+npm run dev     # starts local server at http://localhost:1999
+```
 
-# Log out
+## Deploy
+
+```bash
+cd gave-proper
+npm run deploy
+```
+
+## PartyKit CLI reference
+
+```bash
+npm install partykit@latest     # install/update CLI
+
+npx partykit dev                # local dev server
+npx partykit deploy             # deploy to PartyKit cloud
+npx partykit tail               # stream live logs
+npx partykit list               # list deployed projects
+npx partykit delete             # delete a project
+
+npx partykit env list           # list env var keys
+npx partykit env add <key>      # add/update an env var
+npx partykit env remove <key>   # remove an env var
+npx partykit env pull           # pull env vars to partykit.json
+npx partykit env push           # push env vars to platform
+
+npx partykit login              # log in via GitHub
 npx partykit logout
-
-# Show currently logged in user
 npx partykit whoami
-
-# Generatgging
-npx partykit tail
-npx partykit tail --name my-project
-
-# List all deployed projects
-npx partykit list
-
-# Delete a deployed project
-npx partykit delete
-npx partykit delete --name my-project
+npx partykit token generate     # generate token for CI/CD
 ```
-
-### Environment Variable Commands
-
-```bash
-# List all configured env var keys
-npx partykit env list
-
-# Add or update an env var (prompts for value)
-npx partykit env add <key>
-
-# Remo with [PartyKit](https://partykit.io).
-
-## PartyKit CLI
-
-Install or update the CLI:
-
-```bash
-npm install partykit@latest
-```
-
-### Project Commands
-
-```bash
-# Add PartyKit to an existing project (creates partykit.json, client.ts, server.ts)
-npx partykit init
-
-# Start local dev server (watches for changes)
-npx partykit dev
-npx partykit dev src/server.ts          # specify entry point
-
-# Deploy to PartyKit platform
-npx partykit deploy
-npx partykit deploy src/server.ts --name my-project
-
-# Tail live logs for debu
-
-A multiplayer minesweeper game built

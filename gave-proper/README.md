@@ -1,11 +1,43 @@
-## 🎈 gave-proper
+# gave-proper — Space War
 
-Welcome to the party, pal!
+A 2-player real-time PvP space war game running on [PartyKit](https://partykit.io).
 
-This is a [Partykit](https://partykit.io) project, which lets you create real-time collaborative applications with minimal coding effort.
+## Game rules
 
-[`server.ts`](./src/server.ts) is the server-side code, which is responsible for handling WebSocket events and HTTP requests. [`client.ts`](./src/client.ts) is the client-side code, which connects to the server and listens for events.
+- Each player starts with **100 HP** and **0 rockets**
+- **Build Rocket** — takes 10 seconds, one at a time
+- **Fire** — costs 1 rocket, deals **20 damage** to the opponent
+- First player to reach 0 HP loses
+- You cannot see the opponent's rockets or build status — intel blackout
 
-You can start developing by running `npm run dev` and opening [http://localhost:1999](http://localhost:1999) in your browser. When you're ready, you can deploy your application on to the PartyKit cloud with `npm run deploy`.
+## Architecture
 
-Refer to our docs for more information: https://github.com/partykit/partykit/blob/main/README.md. For more help, reach out to us on [Discord](https://discord.gg/g5uqHQJc3z), [GitHub](https://github.com/partykit/partykit), or [Twitter](https://twitter.com/partykit_io).
+The server (`src/server.ts`) is the single source of truth. The frontend only sends intent (`BUILD_ROCKET`, `FIRE_ROCKET`, `READY`) and renders what the server sends back. No game logic runs in the browser.
+
+### Server → client messages
+
+| Message | Recipient | Description |
+|---|---|---|
+| `STATE` | individual | Player's own state + opponent HP |
+| `WAITING_FOR_OPPONENT` | individual | Sent when room has 1 player |
+| `ROCKET_READY` | individual | Build timer completed |
+| `ATTACKED` | defender only | Incoming hit with damage + new HP |
+| `FIRE_CONFIRMED` | shooter only | Shot landed, opponent's new HP |
+| `GAME_OVER` | broadcast | Match ended, includes winner ID |
+| `OPPONENT_DISCONNECTED` | individual | Other player left |
+| `ROOM_FULL` | individual | 3rd connection attempt rejected |
+
+## Development
+
+```bash
+npm install
+npm run dev     # http://localhost:1999
+```
+
+Add `?room=test` to the URL to use a fixed room during development. Open two tabs to test both players.
+
+## Deploy
+
+```bash
+npm run deploy
+```
